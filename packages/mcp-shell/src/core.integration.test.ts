@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { invokeCore } from './core.js';
 import type { CoreRequest } from './contracts.js';
+import { callTool } from './tools.js';
 
 const cargoArgs = ['run', '-q', '-p', 'randdb-cli'];
 
@@ -133,6 +134,35 @@ describe('Rust core boundary', () => {
             },
           ],
           truncated: false,
+        },
+      });
+
+      const toolResponse = await callTool(
+        'codebase-retrieval',
+        {
+          repo_path: root,
+          information_request: 'Find source function',
+          technical_terms: ['source'],
+          mode: 'quick',
+          include_globs: ['src/*.rs'],
+          language: ['rust'],
+          output_format: 'both',
+          return_debug: true,
+        },
+        { command: 'cargo', args: cargoArgs },
+      );
+      expect(toolResponse.isError).toBeUndefined();
+      expect(JSON.parse(toolResponse.content[0].text)).toMatchObject({
+        operation: 'codebase-retrieval',
+        payload: {
+          markdown: expect.stringContaining('source'),
+          pack: {
+            files: [
+              {
+                path: 'src/lib.rs',
+              },
+            ],
+          },
         },
       });
 
