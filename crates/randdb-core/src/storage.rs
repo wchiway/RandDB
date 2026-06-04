@@ -5,6 +5,9 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 use crate::chunking::ChunkRecord;
 use crate::contract::{HealthState, IndexRunSummary};
 use crate::fts::{ChunkFtsResult, FileFtsResult};
+use crate::vector::{
+    cosine_similarity, decode_embedding, encode_embedding, ChunkVector, VectorSearchResult,
+};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -96,6 +99,15 @@ impl Store {
                FOREIGN KEY(file_path) REFERENCES files(path) ON DELETE CASCADE
              );
              CREATE INDEX IF NOT EXISTS chunks_file_path_idx ON chunks(file_path);
+             CREATE TABLE IF NOT EXISTS chunk_vectors (
+               chunk_id TEXT PRIMARY KEY,
+               file_path TEXT NOT NULL,
+               chunk_index INTEGER NOT NULL,
+               embedding BLOB NOT NULL,
+               dimensions INTEGER NOT NULL,
+               FOREIGN KEY(chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS chunk_vectors_file_path_idx ON chunk_vectors(file_path);
              CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                path UNINDEXED,
                language UNINDEXED,
@@ -236,6 +248,10 @@ impl Store {
     }
 
     pub fn delete_file(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunk_vectors WHERE file_path = ?1",
+            params![path],
+        )?;
         self.conn
             .execute("DELETE FROM chunks_fts WHERE file_path = ?1", params![path])?;
         self.conn
@@ -266,6 +282,10 @@ impl Store {
     }
 
     pub fn replace_file_chunks(&self, file_path: &str, chunks: &[ChunkRecord]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunk_vectors WHERE file_path = ?1",
+            params![file_path],
+        )?;
         self.conn.execute(
             "DELETE FROM chunks_fts WHERE file_path = ?1",
             params![file_path],
@@ -337,6 +357,76 @@ impl Store {
             })
         })?;
         rows.collect()
+    }
+
+    pub fn replace_file_vectors(&self, file_path: &str, vectors: &[ChunkVector]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunk_vectors WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO chunk_vectors (chunk_id, file_path, chunk_index, embedding, dimensions)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+
+        for vector in vectors {
+            stmt.execute(params![
+                vector.chunk_id,
+                vector.file_path,
+                vector.chunk_index,
+                encode_embedding(&vector.embedding),
+                vector.embedding.len() as i64,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn search_vectors(
+        &self,
+        query_embedding: &[f32],
+        limit: u32,
+    ) -> Result<Vec<VectorSearchResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, file_path, chunk_index, embedding
+             FROM chunk_vectors
+             ORDER BY file_path, chunk_index",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+            ))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            let (chunk_id, file_path, chunk_index, bytes) = row?;
+            if let Some(embedding) = decode_embedding(&bytes) {
+                if let Some(score) = cosine_similarity(query_embedding, &embedding) {
+                    results.push(VectorSearchResult {
+                        chunk_id,
+                        file_path,
+                        chunk_index,
+                        score,
+                    });
+                }
+            }
+        }
+
+        results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.chunk_id.cmp(&right.chunk_id))
+        });
+        results.truncate(limit as usize);
+        Ok(results)
+    }
+
+    pub fn vector_count(&self) -> Result<u64> {
+        self.count_table("chunk_vectors")
     }
 
     pub fn all_file_paths(&self) -> Result<Vec<String>> {
@@ -791,5 +881,153 @@ mod tests {
                 .chunk_id,
             "src/lib.rs:hash-1:0"
         );
+    }
+
+    #[test]
+    fn vectors_rank_by_cosine_similarity_and_replace_per_file() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 12,
+            content: "vector tokens".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let chunks = vec![
+            ChunkRecord {
+                id: "src/lib.rs:hash-1:0".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                chunk_index: 0,
+                start_line: 1,
+                end_line: 1,
+                start_utf16: 0,
+                end_utf16: 6,
+                breadcrumb: Some("src/lib.rs".to_string()),
+                content: "first".to_string(),
+            },
+            ChunkRecord {
+                id: "src/lib.rs:hash-1:1".to_string(),
+                file_path: "src/lib.rs".to_string(),
+                chunk_index: 1,
+                start_line: 2,
+                end_line: 2,
+                start_utf16: 6,
+                end_utf16: 12,
+                breadcrumb: Some("src/lib.rs".to_string()),
+                content: "second".to_string(),
+            },
+        ];
+        store
+            .replace_file_chunks("src/lib.rs", &chunks)
+            .expect("chunks replace");
+        store
+            .replace_file_vectors(
+                "src/lib.rs",
+                &[
+                    ChunkVector {
+                        chunk_id: "src/lib.rs:hash-1:0".to_string(),
+                        file_path: "src/lib.rs".to_string(),
+                        chunk_index: 0,
+                        embedding: vec![1.0, 0.0],
+                    },
+                    ChunkVector {
+                        chunk_id: "src/lib.rs:hash-1:1".to_string(),
+                        file_path: "src/lib.rs".to_string(),
+                        chunk_index: 1,
+                        embedding: vec![0.0, 1.0],
+                    },
+                ],
+            )
+            .expect("vectors replace");
+
+        let results = store.search_vectors(&[1.0, 0.0], 2).expect("vector search");
+
+        assert_eq!(results[0].chunk_id, "src/lib.rs:hash-1:0");
+        assert_eq!(results[1].chunk_id, "src/lib.rs:hash-1:1");
+        assert_eq!(store.vector_count().expect("vector count"), 2);
+
+        store
+            .replace_file_vectors(
+                "src/lib.rs",
+                &[ChunkVector {
+                    chunk_id: "src/lib.rs:hash-1:1".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    chunk_index: 1,
+                    embedding: vec![0.0, 1.0],
+                }],
+            )
+            .expect("vectors replace again");
+
+        let results = store
+            .search_vectors(&[0.0, 1.0], 10)
+            .expect("vector search");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk_id, "src/lib.rs:hash-1:1");
+        assert_eq!(store.vector_count().expect("vector count"), 1);
+    }
+
+    #[test]
+    fn vectors_are_cleared_when_chunks_or_files_are_replaced() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 12,
+            content: "vector tokens".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let chunks = vec![ChunkRecord {
+            id: "src/lib.rs:hash-1:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 6,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "first".to_string(),
+        }];
+        store
+            .replace_file_chunks("src/lib.rs", &chunks)
+            .expect("chunks replace");
+        store
+            .replace_file_vectors(
+                "src/lib.rs",
+                &[ChunkVector {
+                    chunk_id: "src/lib.rs:hash-1:0".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    chunk_index: 0,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .expect("vectors replace");
+        assert_eq!(store.vector_count().expect("vector count"), 1);
+
+        store
+            .replace_file_chunks("src/lib.rs", &[])
+            .expect("chunks clear");
+        assert_eq!(store.vector_count().expect("vector count"), 0);
+
+        store
+            .replace_file_chunks("src/lib.rs", &chunks)
+            .expect("chunks replace again");
+        store
+            .replace_file_vectors(
+                "src/lib.rs",
+                &[ChunkVector {
+                    chunk_id: "src/lib.rs:hash-1:0".to_string(),
+                    file_path: "src/lib.rs".to_string(),
+                    chunk_index: 0,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .expect("vectors replace again");
+
+        store.delete_file("src/lib.rs").expect("file deletes");
+        assert_eq!(store.vector_count().expect("vector count"), 0);
     }
 }
