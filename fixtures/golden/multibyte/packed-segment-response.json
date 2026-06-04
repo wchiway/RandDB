@@ -1,0 +1,27 @@
+{
+  "operation": "codebase-retrieval",
+  "payload": {
+    "format": "json",
+    "pack": {
+      "files": [
+        {
+          "path": "src/lib.rs",
+          "language": "rust",
+          "segments": [
+            {
+              "start_line": 1,
+              "end_line": 1,
+              "start_utf16": 0,
+              "end_utf16": 4,
+              "breadcrumb": "emoji_width_marker",
+              "text": "a🚀文",
+              "score": 1.0
+            }
+          ]
+        }
+      ],
+      "char_count": 4,
+      "truncated": false
+    }
+  }
+}

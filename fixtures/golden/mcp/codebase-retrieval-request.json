@@ -1,0 +1,17 @@
+{
+  "operation": "codebase-retrieval",
+  "payload": {
+    "repo_path": "/repo",
+    "information_request": "Find retrieval flow",
+    "technical_terms": ["SearchService"],
+    "mode": "balanced",
+    "exclude_globs": ["target/**"],
+    "language": ["rust"],
+    "max_total_chars": 20000,
+    "max_files": 5,
+    "max_segments_per_file": 2,
+    "return_debug": true,
+    "low_confidence_behavior": "return_with_warning",
+    "output_format": "both"
+  }
+}

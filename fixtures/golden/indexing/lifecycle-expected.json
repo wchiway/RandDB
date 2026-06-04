@@ -1,0 +1,29 @@
+{
+  "first": {
+    "scanned_files": 2,
+    "added_files": 2,
+    "modified_files": 0,
+    "deleted_files": 0,
+    "unchanged_files": 0,
+    "skipped_embeddings": 0,
+    "file_count": 2
+  },
+  "second": {
+    "scanned_files": 2,
+    "added_files": 0,
+    "modified_files": 0,
+    "deleted_files": 0,
+    "unchanged_files": 2,
+    "skipped_embeddings": 2,
+    "file_count": 2
+  },
+  "third": {
+    "scanned_files": 1,
+    "added_files": 0,
+    "modified_files": 1,
+    "deleted_files": 1,
+    "unchanged_files": 0,
+    "skipped_embeddings": 0,
+    "file_count": 1
+  }
+}
