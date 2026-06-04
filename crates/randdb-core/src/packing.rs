@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::Result;
 
@@ -101,6 +101,10 @@ pub fn expand_context(
     seeds: &[ScoredChunk],
     neighbor_radius: u32,
 ) -> Result<Vec<ScoredChunk>> {
+    let seed_scores = seeds
+        .iter()
+        .map(|seed| (seed.chunk.id.clone(), seed.score))
+        .collect::<HashMap<_, _>>();
     let mut out = Vec::new();
     let mut seen = HashSet::<String>::new();
 
@@ -110,18 +114,25 @@ pub fn expand_context(
         let radius = i64::from(neighbor_radius);
         for chunk in file_chunks {
             let distance = (i64::from(chunk.chunk_index) - center).abs();
-            if distance <= radius && seen.insert(chunk.id.clone()) {
-                let score = if chunk.id == seed.chunk.id {
-                    seed.score
-                } else {
-                    seed.score * 0.5
-                };
+            if distance > radius {
+                continue;
+            }
+
+            if seen.insert(chunk.id.clone()) {
+                let score = seed_scores
+                    .get(&chunk.id)
+                    .copied()
+                    .unwrap_or(seed.score * 0.5);
                 out.push(ScoredChunk {
                     chunk,
                     score,
                     vector_score: None,
                     lexical_score: None,
                 });
+            } else if let Some(seed_score) = seed_scores.get(&chunk.id) {
+                if let Some(existing) = out.iter_mut().find(|scored| scored.chunk.id == chunk.id) {
+                    existing.score = existing.score.max(*seed_score);
+                }
             }
         }
     }
@@ -289,6 +300,43 @@ mod tests {
         assert!(pack.truncated);
         assert_eq!(pack.files[0].segments.len(), 1);
         assert!(pack.char_count <= 12);
+    }
+
+    #[test]
+    fn expansion_promotes_seed_score_when_seed_was_first_added_as_neighbor() {
+        let store = Store::open_in_memory().expect("store opens");
+        seed_file(
+            &store,
+            "src/lib.rs",
+            "first\nsecond\n",
+            &[
+                chunk("src/lib.rs", 0, 0, 6, "first\n"),
+                chunk("src/lib.rs", 1, 6, 13, "second\n"),
+            ],
+        );
+        let first = ScoredChunk {
+            chunk: store
+                .chunk_by_id("src/lib.rs:hash:0")
+                .expect("chunk reads")
+                .expect("chunk exists"),
+            score: 0.8,
+            vector_score: None,
+            lexical_score: None,
+        };
+        let second = ScoredChunk {
+            chunk: store
+                .chunk_by_id("src/lib.rs:hash:1")
+                .expect("chunk reads")
+                .expect("chunk exists"),
+            score: 1.0,
+            vector_score: None,
+            lexical_score: None,
+        };
+
+        let expanded = expand_context(&store, &[first, second], 1).expect("expands");
+
+        assert_eq!(expanded[0].chunk.id, "src/lib.rs:hash:1");
+        assert_eq!(expanded[0].score, 1.0);
     }
 
     fn seed_file(store: &Store, path: &str, content: &str, chunks: &[ChunkRecord]) {

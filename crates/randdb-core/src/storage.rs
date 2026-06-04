@@ -489,6 +489,11 @@ impl Store {
     }
 
     pub fn search_files_fts(&self, query: &str, limit: u32) -> Result<Vec<FileFtsResult>> {
+        let query = fts_literal_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT path, language, bm25(files_fts) AS score
              FROM files_fts
@@ -507,6 +512,11 @@ impl Store {
     }
 
     pub fn search_chunks_fts(&self, query: &str, limit: u32) -> Result<Vec<ChunkFtsResult>> {
+        let query = fts_literal_query(query);
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT chunk_id, file_path, chunk_index, bm25(chunks_fts) AS score
              FROM chunks_fts
@@ -636,6 +646,7 @@ impl Store {
             "index.skipped_embeddings",
             summary.skipped_embeddings as i64,
         )?;
+        self.increment_stat("index.embedded_chunks", summary.embedded_chunks as i64)?;
         Ok(())
     }
 
@@ -681,6 +692,14 @@ impl Store {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         self.conn.query_row(&sql, [], |row| row.get(0))
     }
+}
+
+fn fts_literal_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn health_state_name(state: &HealthState) -> &'static str {
@@ -836,6 +855,41 @@ mod tests {
             .search_files_fts("replacement_symbol", 10)
             .expect("deleted token search")
             .is_empty());
+    }
+
+    #[test]
+    fn fts_search_treats_special_characters_as_literals() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 24,
+            content: "pub fn SearchTarget() {}".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let chunks = vec![ChunkRecord {
+            id: "src/lib.rs:hash-1:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 24,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "pub fn SearchTarget() {}".to_string(),
+        }];
+        store
+            .replace_file_chunks("src/lib.rs", &chunks)
+            .expect("chunks replace");
+
+        store
+            .search_files_fts("SearchTarget* \"", 10)
+            .expect("file fts special-character query stays literal");
+        store
+            .search_chunks_fts("SearchTarget* \"", 10)
+            .expect("chunk fts special-character query stays literal");
     }
 
     #[test]
@@ -1097,5 +1151,28 @@ mod tests {
 
         store.delete_file("src/lib.rs").expect("file deletes");
         assert_eq!(store.vector_count().expect("vector count"), 0);
+    }
+
+    #[test]
+    fn complete_index_run_counts_embedded_chunks() {
+        let store = Store::open_in_memory().expect("store opens");
+        let summary = IndexRunSummary {
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: 2,
+            scanned_files: 3,
+            unchanged_files: 0,
+            added_files: 3,
+            modified_files: 0,
+            deleted_files: 0,
+            embedded_chunks: 7,
+            skipped_embeddings: 0,
+            health_state: HealthState::Healthy,
+        };
+
+        store
+            .complete_index_run(&summary)
+            .expect("index run completes");
+
+        assert_eq!(store.stat("index.embedded_chunks").expect("stat reads"), 7);
     }
 }

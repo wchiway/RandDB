@@ -10,7 +10,7 @@ export async function invokeCore(
   request: CoreRequest,
   options: CoreInvokerOptions = {},
 ): Promise<CoreResult> {
-  const command = options.command ?? process.env.RANDB_CORE_BIN ?? 'randdb-cli';
+  const command = options.command ?? process.env.RANDDB_CORE_BIN ?? 'randdb-cli';
   const args = options.args ?? [];
   const input = JSON.stringify(request);
 
