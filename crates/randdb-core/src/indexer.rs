@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -49,14 +49,55 @@ impl From<rusqlite::Error> for IndexError {
 
 pub type IndexResult<T> = Result<T, IndexError>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexOptions {
+    pub ignored_names: Vec<OsString>,
+}
+
+impl Default for IndexOptions {
+    fn default() -> Self {
+        Self {
+            ignored_names: [".git", ".serena", "node_modules", "target", "dist"]
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
+        }
+    }
+}
+
 pub fn index_repository(store: &Store, root: impl AsRef<Path>) -> IndexResult<IndexRunSummary> {
-    let root = root.as_ref();
+    index_repository_with_options(store, root, &IndexOptions::default())
+}
+
+pub fn index_repository_with_options(
+    store: &Store,
+    root: impl AsRef<Path>,
+    options: &IndexOptions,
+) -> IndexResult<IndexRunSummary> {
+    store.begin_index_run()?;
+    match index_repository_inner(store, root.as_ref(), options) {
+        Ok(summary) => {
+            store.complete_index_run(&summary)?;
+            Ok(summary)
+        }
+        Err(error) => {
+            store.mark_index_failed(&error.to_string())?;
+            Err(error)
+        }
+    }
+}
+
+fn index_repository_inner(
+    store: &Store,
+    root: &Path,
+    options: &IndexOptions,
+) -> IndexResult<IndexRunSummary> {
     if !root.exists() {
         return Err(IndexError::InvalidRoot(root.to_path_buf()));
     }
 
     let started_at_unix_ms = now_unix_ms();
-    let records = scan_repository(root)?;
+    let records = scan_repository_with_options(root, options)?;
     let scanned_paths = records
         .iter()
         .map(|record| record.path.clone())
@@ -109,30 +150,41 @@ pub fn index_repository(store: &Store, root: impl AsRef<Path>) -> IndexResult<In
     }
 
     summary.finished_at_unix_ms = now_unix_ms();
-    store.record_index_run(&summary)?;
     Ok(summary)
 }
 
 pub fn scan_repository(root: impl AsRef<Path>) -> IndexResult<Vec<FileRecord>> {
+    scan_repository_with_options(root, &IndexOptions::default())
+}
+
+pub fn scan_repository_with_options(
+    root: impl AsRef<Path>,
+    options: &IndexOptions,
+) -> IndexResult<Vec<FileRecord>> {
     let root = root.as_ref();
     let mut files = Vec::new();
-    collect_files(root, root, &mut files)?;
+    collect_files(root, root, &mut files, options)?;
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
 
-fn collect_files(root: &Path, current: &Path, files: &mut Vec<FileRecord>) -> IndexResult<()> {
+fn collect_files(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<FileRecord>,
+    options: &IndexOptions,
+) -> IndexResult<()> {
     for entry in fs::read_dir(current)? {
         let entry = entry?;
         let path = entry.path();
         let file_name = path.file_name();
-        if should_skip_path(file_name) {
+        if should_skip_path(file_name, options) {
             continue;
         }
 
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_files(root, &path, files)?;
+            collect_files(root, &path, files, options)?;
         } else if metadata.is_file() {
             let bytes = fs::read(&path)?;
             let hash = hash_bytes(&bytes);
@@ -154,11 +206,8 @@ fn collect_files(root: &Path, current: &Path, files: &mut Vec<FileRecord>) -> In
     Ok(())
 }
 
-fn should_skip_path(file_name: Option<&OsStr>) -> bool {
-    matches!(
-        file_name.and_then(OsStr::to_str),
-        Some(".git" | ".serena" | "node_modules" | "target" | "dist")
-    )
+fn should_skip_path(file_name: Option<&OsStr>, options: &IndexOptions) -> bool {
+    file_name.is_some_and(|name| options.ignored_names.iter().any(|ignored| ignored == name))
 }
 
 fn normalize_relative_path(root: &Path, path: &Path) -> IndexResult<String> {
@@ -353,5 +402,88 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["Cargo.toml"])
         );
+    }
+
+    #[test]
+    fn scan_repository_honors_custom_ignored_names() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("vendor")).expect("vendor dir");
+        fs::write(root.join("vendor/generated.rs"), "pub fn generated() {}\n")
+            .expect("write generated");
+        fs::write(root.join("src.rs"), "pub fn source() {}\n").expect("write source");
+        let options = IndexOptions {
+            ignored_names: vec![OsString::from("vendor")],
+        };
+
+        let files = scan_repository_with_options(root, &options).expect("scan repository");
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["src.rs"])
+        );
+    }
+
+    #[test]
+    fn index_repository_updates_recovery_state_version_and_stats() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::write(root.join("src.rs"), "pub fn source() {}\n").expect("write source");
+        let store = Store::open_in_memory().expect("store opens");
+
+        let first = index_repository(&store, root).expect("first index");
+
+        assert_eq!(first.added_files, 1);
+        assert_eq!(
+            store.index_recovery_state().expect("state reads"),
+            crate::storage::IndexRecoveryState::Clean
+        );
+        assert_eq!(store.index_version().expect("version reads"), 1);
+        assert_eq!(store.stat("index.total_runs").expect("total runs"), 1);
+        assert_eq!(store.stat("index.scanned_files").expect("scanned files"), 1);
+        assert_eq!(store.stat("index.added_files").expect("added files"), 1);
+
+        let second = index_repository(&store, root).expect("second index");
+
+        assert_eq!(second.unchanged_files, 1);
+        assert_eq!(store.index_version().expect("version reads"), 2);
+        assert_eq!(store.stat("index.total_runs").expect("total runs"), 2);
+        assert_eq!(
+            store
+                .stat("index.unchanged_files")
+                .expect("unchanged files"),
+            1
+        );
+        assert_eq!(
+            store
+                .stat("index.skipped_embeddings")
+                .expect("skipped embeddings"),
+            1
+        );
+    }
+
+    #[test]
+    fn index_repository_marks_failed_state_when_scan_fails() {
+        let temp = TempDir::new().expect("tempdir");
+        let missing_root = temp.path().join("missing");
+        let store = Store::open_in_memory().expect("store opens");
+
+        let error = index_repository(&store, &missing_root).expect_err("index fails");
+
+        assert!(error.to_string().contains("repository root does not exist"));
+        assert_eq!(
+            store.index_recovery_state().expect("state reads"),
+            crate::storage::IndexRecoveryState::Failed
+        );
+        assert_eq!(store.index_version().expect("version reads"), 0);
+        assert_eq!(store.stat("index.total_runs").expect("total runs"), 0);
+        assert!(store
+            .metadata("index.last_error")
+            .expect("last error reads")
+            .expect("last error set")
+            .contains("repository root does not exist"));
     }
 }

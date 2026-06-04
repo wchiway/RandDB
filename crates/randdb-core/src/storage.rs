@@ -31,6 +31,31 @@ pub struct IndexedFile {
     pub language: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexRecoveryState {
+    Clean,
+    Running,
+    Failed,
+}
+
+impl IndexRecoveryState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Running => "running",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        match value {
+            "running" => Self::Running,
+            "failed" => Self::Failed,
+            _ => Self::Clean,
+        }
+    }
+}
+
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -151,6 +176,31 @@ impl Store {
             )
             .optional()
             .map(|value| value.unwrap_or_default())
+    }
+
+    pub fn begin_index_run(&self) -> Result<()> {
+        self.set_metadata("index.recovery_state", IndexRecoveryState::Running.as_str())?;
+        self.set_metadata("index.last_error", "")
+    }
+
+    pub fn index_recovery_state(&self) -> Result<IndexRecoveryState> {
+        Ok(self
+            .metadata("index.recovery_state")?
+            .as_deref()
+            .map(IndexRecoveryState::from_str)
+            .unwrap_or(IndexRecoveryState::Clean))
+    }
+
+    pub fn mark_index_failed(&self, error: &str) -> Result<()> {
+        self.set_metadata("index.recovery_state", IndexRecoveryState::Failed.as_str())?;
+        self.set_metadata("index.last_error", error)
+    }
+
+    pub fn index_version(&self) -> Result<u64> {
+        Ok(self
+            .metadata("index.version")?
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_default())
     }
 
     pub fn upsert_file(&self, record: &FileRecord) -> Result<()> {
@@ -444,6 +494,24 @@ impl Store {
             ],
         )?;
         self.increment_stat("index.total_runs", 1)?;
+        Ok(())
+    }
+
+    pub fn complete_index_run(&self, summary: &IndexRunSummary) -> Result<()> {
+        self.record_index_run(summary)?;
+        let version = self.index_version()?.saturating_add(1);
+        self.set_metadata("index.version", &version.to_string())?;
+        self.set_metadata("index.recovery_state", IndexRecoveryState::Clean.as_str())?;
+        self.set_metadata("index.last_error", "")?;
+        self.increment_stat("index.scanned_files", summary.scanned_files as i64)?;
+        self.increment_stat("index.unchanged_files", summary.unchanged_files as i64)?;
+        self.increment_stat("index.added_files", summary.added_files as i64)?;
+        self.increment_stat("index.modified_files", summary.modified_files as i64)?;
+        self.increment_stat("index.deleted_files", summary.deleted_files as i64)?;
+        self.increment_stat(
+            "index.skipped_embeddings",
+            summary.skipped_embeddings as i64,
+        )?;
         Ok(())
     }
 
