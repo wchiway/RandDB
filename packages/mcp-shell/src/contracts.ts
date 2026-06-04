@@ -7,7 +7,9 @@ export type CoreRequest =
   | { operation: 'list-files'; payload: ListFilesInput }
   | { operation: 'find-references'; payload: FindReferencesInput }
   | { operation: 'get-symbol-definition'; payload: GetSymbolDefinitionInput }
-  | { operation: 'stats'; payload: StatsInput };
+  | { operation: 'stats'; payload: StatsInput }
+  | { operation: 'index-repository'; payload: IndexRepositoryInput }
+  | { operation: 'health'; payload: HealthInput };
 
 export interface CodebaseRetrievalInput {
   repo_path: string;
@@ -47,6 +49,15 @@ export interface GetSymbolDefinitionInput {
 }
 
 export interface StatsInput {
+  repo_path: string;
+}
+
+export interface IndexRepositoryInput {
+  repo_path: string;
+  force_rebuild?: boolean;
+}
+
+export interface HealthInput {
   repo_path: string;
 }
 

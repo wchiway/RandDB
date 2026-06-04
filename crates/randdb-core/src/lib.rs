@@ -1,5 +1,6 @@
 pub mod chunking;
 pub mod contract;
+pub mod executor;
 pub mod fts;
 pub mod indexer;
 pub mod packing;
@@ -10,6 +11,7 @@ pub mod vector;
 
 pub use chunking::*;
 pub use contract::*;
+pub use executor::*;
 pub use fts::*;
 pub use indexer::*;
 pub use packing::*;

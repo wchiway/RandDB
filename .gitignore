@@ -5,4 +5,5 @@
 **/dist/
 *.log
 .serena/
+.randdb/
 CLAUDE.md

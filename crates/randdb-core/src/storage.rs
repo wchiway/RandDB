@@ -470,22 +470,25 @@ impl Store {
     }
 
     pub fn list_files(&self, max_results: Option<u32>) -> Result<Vec<IndexedFile>> {
-        let limit = i64::from(max_results.unwrap_or(200));
-        let mut stmt = self.conn.prepare(
-            "SELECT path, hash, size_bytes, language
-             FROM files
-             ORDER BY path
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| {
+        let sql = "SELECT path, hash, size_bytes, language FROM files ORDER BY path";
+        let map_row = |row: &rusqlite::Row<'_>| {
             Ok(IndexedFile {
                 path: row.get(0)?,
                 hash: row.get(1)?,
                 size_bytes: row.get(2)?,
                 language: row.get(3)?,
             })
-        })?;
-        rows.collect()
+        };
+
+        if let Some(max_results) = max_results {
+            let mut stmt = self.conn.prepare(&format!("{sql} LIMIT ?1"))?;
+            let rows = stmt.query_map(params![i64::from(max_results)], map_row)?;
+            rows.collect()
+        } else {
+            let mut stmt = self.conn.prepare(sql)?;
+            let rows = stmt.query_map([], map_row)?;
+            rows.collect()
+        }
     }
 
     pub fn search_files_fts(&self, query: &str, limit: u32) -> Result<Vec<FileFtsResult>> {

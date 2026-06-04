@@ -57,10 +57,17 @@ pub struct IndexOptions {
 impl Default for IndexOptions {
     fn default() -> Self {
         Self {
-            ignored_names: [".git", ".serena", "node_modules", "target", "dist"]
-                .into_iter()
-                .map(OsString::from)
-                .collect(),
+            ignored_names: [
+                ".git",
+                ".randdb",
+                ".serena",
+                "node_modules",
+                "target",
+                "dist",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
         }
     }
 }

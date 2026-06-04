@@ -1,6 +1,6 @@
 use std::io::{self, Read};
 
-use randdb_core::{CoreRequest, CoreResult};
+use randdb_core::{execute_request, CoreRequest, CoreResult};
 
 fn main() {
     let mut input = String::new();
@@ -17,7 +17,7 @@ fn main() {
         }
     };
 
-    let result = CoreResult::unsupported(request.operation_name());
+    let result = execute_request(request);
     match serde_json::to_string_pretty(&result) {
         Ok(json) => println!("{json}"),
         Err(error) => print_error("serialize_response", error.to_string()),
