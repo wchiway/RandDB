@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
+use crate::chunking::{chunk_file, ChunkConfig};
 use crate::contract::{HealthState, IndexRunSummary};
 use crate::storage::{FileRecord, Store};
 
@@ -82,10 +83,18 @@ pub fn index_repository(store: &Store, root: impl AsRef<Path>) -> IndexResult<In
             }
             Some(_) => {
                 store.upsert_file(&record)?;
+                store.replace_file_chunks(
+                    &record.path,
+                    &chunk_file(&record, &ChunkConfig::default()),
+                )?;
                 summary.modified_files += 1;
             }
             None => {
                 store.upsert_file(&record)?;
+                store.replace_file_chunks(
+                    &record.path,
+                    &chunk_file(&record, &ChunkConfig::default()),
+                )?;
                 summary.added_files += 1;
             }
         }
@@ -287,6 +296,39 @@ mod tests {
             .expect("binary indexed");
         assert_eq!(binary.language, "binary");
         assert_eq!(binary.content, "");
+    }
+
+    #[test]
+    fn index_repository_writes_replaces_and_deletes_chunks() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        fs::create_dir_all(root.join("src")).expect("src dir");
+        fs::write(root.join("src/lib.rs"), "a🚀文\n").expect("write lib");
+        let store = Store::open_in_memory().expect("store opens");
+
+        index_repository(&store, root).expect("first index");
+        let first_chunks = store.chunks_for_file("src/lib.rs").expect("chunks read");
+        assert_eq!(first_chunks.len(), 1);
+        assert_eq!(first_chunks[0].start_utf16, 0);
+        assert_eq!(first_chunks[0].end_utf16, 5);
+        assert_eq!(first_chunks[0].content, "a🚀文\n");
+
+        fs::write(root.join("src/lib.rs"), "next\n").expect("modify lib");
+        index_repository(&store, root).expect("second index");
+        let second_chunks = store.chunks_for_file("src/lib.rs").expect("chunks read");
+        assert_eq!(second_chunks.len(), 1);
+        assert_eq!(second_chunks[0].start_utf16, 0);
+        assert_eq!(second_chunks[0].end_utf16, 5);
+        assert_eq!(second_chunks[0].content, "next\n");
+        assert_ne!(first_chunks[0].id, second_chunks[0].id);
+
+        fs::remove_file(root.join("src/lib.rs")).expect("delete lib");
+        index_repository(&store, root).expect("third index");
+        assert!(store
+            .chunks_for_file("src/lib.rs")
+            .expect("chunks read")
+            .is_empty());
+        assert_eq!(store.chunk_count().expect("chunk count"), 0);
     }
 
     #[test]

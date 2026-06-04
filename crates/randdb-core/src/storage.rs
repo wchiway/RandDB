@@ -2,6 +2,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
+use crate::chunking::ChunkRecord;
 use crate::contract::{HealthState, IndexRunSummary};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -194,6 +195,65 @@ impl Store {
             .optional()
     }
 
+    pub fn replace_file_chunks(&self, file_path: &str, chunks: &[ChunkRecord]) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chunks WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO chunks (
+               id,
+               file_path,
+               chunk_index,
+               start_line,
+               end_line,
+               start_utf16,
+               end_utf16,
+               breadcrumb,
+               content
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+
+        for chunk in chunks {
+            stmt.execute(params![
+                chunk.id,
+                chunk.file_path,
+                chunk.chunk_index,
+                chunk.start_line,
+                chunk.end_line,
+                chunk.start_utf16,
+                chunk.end_utf16,
+                chunk.breadcrumb,
+                chunk.content,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn chunks_for_file(&self, file_path: &str) -> Result<Vec<ChunkRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, chunk_index, start_line, end_line, start_utf16, end_utf16, breadcrumb, content
+             FROM chunks
+             WHERE file_path = ?1
+             ORDER BY chunk_index",
+        )?;
+        let rows = stmt.query_map(params![file_path], |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                chunk_index: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                start_utf16: row.get(5)?,
+                end_utf16: row.get(6)?,
+                breadcrumb: row.get(7)?,
+                content: row.get(8)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn all_file_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
@@ -318,5 +378,52 @@ mod tests {
             store.file_content("src/lib.rs").expect("content reads"),
             None
         );
+    }
+
+    #[test]
+    fn replaces_file_chunks_as_a_whole() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 12,
+            content: "a🚀文\n".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let first = vec![ChunkRecord {
+            id: "src/lib.rs:hash-1:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 5,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "a🚀文\n".to_string(),
+        }];
+        let second = vec![ChunkRecord {
+            id: "src/lib.rs:hash-2:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 4,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "next".to_string(),
+        }];
+
+        store
+            .replace_file_chunks("src/lib.rs", &first)
+            .expect("first chunks replace");
+        store
+            .replace_file_chunks("src/lib.rs", &second)
+            .expect("second chunks replace");
+
+        let chunks = store.chunks_for_file("src/lib.rs").expect("chunks read");
+        assert_eq!(chunks, second);
+        assert_eq!(store.chunk_count().expect("chunk count"), 1);
     }
 }
