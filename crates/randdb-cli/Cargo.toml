@@ -1,0 +1,9 @@
+[package]
+name = "randdb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+randdb-core = { path = "../randdb-core" }
+serde_json.workspace = true
