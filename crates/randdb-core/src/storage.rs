@@ -4,6 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result};
 
 use crate::chunking::ChunkRecord;
 use crate::contract::{HealthState, IndexRunSummary};
+use crate::fts::{ChunkFtsResult, FileFtsResult};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -70,6 +71,20 @@ impl Store {
                FOREIGN KEY(file_path) REFERENCES files(path) ON DELETE CASCADE
              );
              CREATE INDEX IF NOT EXISTS chunks_file_path_idx ON chunks(file_path);
+             CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+               path UNINDEXED,
+               language UNINDEXED,
+               content,
+               tokenize='unicode61'
+             );
+             CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+               chunk_id UNINDEXED,
+               file_path UNINDEXED,
+               chunk_index UNINDEXED,
+               breadcrumb,
+               content,
+               tokenize='unicode61'
+             );
              CREATE TABLE IF NOT EXISTS metadata (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
@@ -158,6 +173,7 @@ impl Store {
                 record.language
             ],
         )?;
+        self.replace_file_fts(record)?;
         Ok(())
     }
 
@@ -170,6 +186,10 @@ impl Store {
     }
 
     pub fn delete_file(&self, path: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM chunks_fts WHERE file_path = ?1", params![path])?;
+        self.conn
+            .execute("DELETE FROM files_fts WHERE path = ?1", params![path])?;
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![path])?;
         Ok(())
@@ -197,10 +217,14 @@ impl Store {
 
     pub fn replace_file_chunks(&self, file_path: &str, chunks: &[ChunkRecord]) -> Result<()> {
         self.conn.execute(
+            "DELETE FROM chunks_fts WHERE file_path = ?1",
+            params![file_path],
+        )?;
+        self.conn.execute(
             "DELETE FROM chunks WHERE file_path = ?1",
             params![file_path],
         )?;
-        let mut stmt = self.conn.prepare(
+        let mut chunks_stmt = self.conn.prepare(
             "INSERT INTO chunks (
                id,
                file_path,
@@ -213,9 +237,13 @@ impl Store {
                content
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
+        let mut fts_stmt = self.conn.prepare(
+            "INSERT INTO chunks_fts (chunk_id, file_path, chunk_index, breadcrumb, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
 
         for chunk in chunks {
-            stmt.execute(params![
+            chunks_stmt.execute(params![
                 chunk.id,
                 chunk.file_path,
                 chunk.chunk_index,
@@ -223,6 +251,13 @@ impl Store {
                 chunk.end_line,
                 chunk.start_utf16,
                 chunk.end_utf16,
+                chunk.breadcrumb,
+                chunk.content,
+            ])?;
+            fts_stmt.execute(params![
+                chunk.id,
+                chunk.file_path,
+                chunk.chunk_index,
                 chunk.breadcrumb,
                 chunk.content,
             ])?;
@@ -279,6 +314,100 @@ impl Store {
         rows.collect()
     }
 
+    pub fn search_files_fts(&self, query: &str, limit: u32) -> Result<Vec<FileFtsResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, language, bm25(files_fts) AS score
+             FROM files_fts
+             WHERE files_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, i64::from(limit)], |row| {
+            Ok(FileFtsResult {
+                path: row.get(0)?,
+                language: row.get(1)?,
+                score: row.get(2)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn search_chunks_fts(&self, query: &str, limit: u32) -> Result<Vec<ChunkFtsResult>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk_id, file_path, chunk_index, bm25(chunks_fts) AS score
+             FROM chunks_fts
+             WHERE chunks_fts MATCH ?1
+             ORDER BY score
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, i64::from(limit)], |row| {
+            Ok(ChunkFtsResult {
+                chunk_id: row.get(0)?,
+                file_path: row.get(1)?,
+                chunk_index: row.get(2)?,
+                score: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn rebuild_fts(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM files_fts", [])?;
+        self.conn.execute("DELETE FROM chunks_fts", [])?;
+
+        let mut files_stmt = self
+            .conn
+            .prepare("SELECT path, language, content FROM files ORDER BY path")?;
+        let files = files_stmt.query_map([], |row| {
+            Ok(FileRecord {
+                path: row.get(0)?,
+                hash: String::new(),
+                mtime_ms: 0,
+                size_bytes: 0,
+                language: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })?;
+        for file in files {
+            self.replace_file_fts(&file?)?;
+        }
+
+        let mut chunks_stmt = self.conn.prepare(
+            "SELECT id, file_path, chunk_index, breadcrumb, content
+             FROM chunks
+             ORDER BY file_path, chunk_index",
+        )?;
+        let chunks = chunks_stmt.query_map([], |row| {
+            Ok(ChunkRecord {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                chunk_index: row.get(2)?,
+                start_line: 0,
+                end_line: 0,
+                start_utf16: 0,
+                end_utf16: 0,
+                breadcrumb: row.get(3)?,
+                content: row.get(4)?,
+            })
+        })?;
+        let mut stmt = self.conn.prepare(
+            "INSERT INTO chunks_fts (chunk_id, file_path, chunk_index, breadcrumb, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for chunk in chunks {
+            let chunk = chunk?;
+            stmt.execute(params![
+                chunk.id,
+                chunk.file_path,
+                chunk.chunk_index,
+                chunk.breadcrumb,
+                chunk.content,
+            ])?;
+        }
+
+        Ok(())
+    }
+
     pub fn file_count(&self) -> Result<u64> {
         self.count_table("files")
     }
@@ -315,6 +444,18 @@ impl Store {
             ],
         )?;
         self.increment_stat("index.total_runs", 1)?;
+        Ok(())
+    }
+
+    fn replace_file_fts(&self, record: &FileRecord) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE path = ?1",
+            params![record.path],
+        )?;
+        self.conn.execute(
+            "INSERT INTO files_fts (path, language, content) VALUES (?1, ?2, ?3)",
+            params![record.path, record.language, record.content],
+        )?;
         Ok(())
     }
 
@@ -425,5 +566,162 @@ mod tests {
         let chunks = store.chunks_for_file("src/lib.rs").expect("chunks read");
         assert_eq!(chunks, second);
         assert_eq!(store.chunk_count().expect("chunk count"), 1);
+    }
+
+    #[test]
+    fn files_fts_tracks_file_upsert_modify_and_delete() {
+        let store = Store::open_in_memory().expect("store opens");
+        let mut record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 24,
+            content: "pub fn SearchTarget() {}".to_string(),
+            language: "rust".to_string(),
+        };
+
+        store.upsert_file(&record).expect("file upserts");
+        assert_eq!(
+            store
+                .search_files_fts("SearchTarget", 10)
+                .expect("fts search")[0]
+                .path,
+            "src/lib.rs"
+        );
+
+        record.hash = "hash-2".to_string();
+        record.content = "pub fn replacement_symbol() {}".to_string();
+        store.upsert_file(&record).expect("file updates");
+
+        assert!(store
+            .search_files_fts("SearchTarget", 10)
+            .expect("old token search")
+            .is_empty());
+        assert_eq!(
+            store
+                .search_files_fts("replacement_symbol", 10)
+                .expect("new token search")[0]
+                .path,
+            "src/lib.rs"
+        );
+
+        store.delete_file("src/lib.rs").expect("file deletes");
+        assert!(store
+            .search_files_fts("replacement_symbol", 10)
+            .expect("deleted token search")
+            .is_empty());
+    }
+
+    #[test]
+    fn chunks_fts_tracks_per_file_replacement_and_delete() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 12,
+            content: "old_token".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let first = vec![ChunkRecord {
+            id: "src/lib.rs:hash-1:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 9,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "old_token".to_string(),
+        }];
+        let second = vec![ChunkRecord {
+            id: "src/lib.rs:hash-2:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 9,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "new_token".to_string(),
+        }];
+
+        store
+            .replace_file_chunks("src/lib.rs", &first)
+            .expect("first chunks replace");
+        assert_eq!(
+            store
+                .search_chunks_fts("old_token", 10)
+                .expect("old chunk search")[0]
+                .chunk_id,
+            "src/lib.rs:hash-1:0"
+        );
+
+        store
+            .replace_file_chunks("src/lib.rs", &second)
+            .expect("second chunks replace");
+        assert!(store
+            .search_chunks_fts("old_token", 10)
+            .expect("old chunk search")
+            .is_empty());
+        assert_eq!(
+            store
+                .search_chunks_fts("new_token", 10)
+                .expect("new chunk search")[0]
+                .chunk_id,
+            "src/lib.rs:hash-2:0"
+        );
+
+        store.delete_file("src/lib.rs").expect("file deletes");
+        assert!(store
+            .search_chunks_fts("new_token", 10)
+            .expect("deleted chunk search")
+            .is_empty());
+    }
+
+    #[test]
+    fn rebuild_fts_recreates_derived_indexes_from_authoritative_tables() {
+        let store = Store::open_in_memory().expect("store opens");
+        let record = FileRecord {
+            path: "src/lib.rs".to_string(),
+            hash: "hash-1".to_string(),
+            mtime_ms: 10,
+            size_bytes: 12,
+            content: "rebuild_file_token".to_string(),
+            language: "rust".to_string(),
+        };
+        store.upsert_file(&record).expect("file upserts");
+        let chunks = vec![ChunkRecord {
+            id: "src/lib.rs:hash-1:0".to_string(),
+            file_path: "src/lib.rs".to_string(),
+            chunk_index: 0,
+            start_line: 1,
+            end_line: 1,
+            start_utf16: 0,
+            end_utf16: 19,
+            breadcrumb: Some("src/lib.rs".to_string()),
+            content: "rebuild_chunk_token".to_string(),
+        }];
+        store
+            .replace_file_chunks("src/lib.rs", &chunks)
+            .expect("chunks replace");
+
+        store.rebuild_fts().expect("fts rebuilds");
+
+        assert_eq!(
+            store
+                .search_files_fts("rebuild_file_token", 10)
+                .expect("file search")[0]
+                .path,
+            "src/lib.rs"
+        );
+        assert_eq!(
+            store
+                .search_chunks_fts("rebuild_chunk_token", 10)
+                .expect("chunk search")[0]
+                .chunk_id,
+            "src/lib.rs:hash-1:0"
+        );
     }
 }
