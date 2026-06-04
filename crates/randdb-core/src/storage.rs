@@ -453,6 +453,16 @@ impl Store {
         self.count_table("chunk_vectors")
     }
 
+    pub fn embedding_dimensions(&self) -> Result<Option<u32>> {
+        self.conn
+            .query_row(
+                "SELECT dimensions FROM chunk_vectors ORDER BY chunk_id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+    }
+
     pub fn all_file_paths(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT path FROM files ORDER BY path")?;
         let rows = stmt.query_map([], |row| row.get(0))?;
@@ -629,6 +639,32 @@ impl Store {
         Ok(())
     }
 
+    pub fn last_index_run(&self) -> Result<Option<IndexRunSummary>> {
+        self.conn
+            .query_row(
+                "SELECT started_at_unix_ms, finished_at_unix_ms, scanned_files, unchanged_files, added_files, modified_files, deleted_files, embedded_chunks, skipped_embeddings, health_state
+                 FROM index_runs
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(IndexRunSummary {
+                        started_at_unix_ms: row.get(0)?,
+                        finished_at_unix_ms: row.get(1)?,
+                        scanned_files: row.get(2)?,
+                        unchanged_files: row.get(3)?,
+                        added_files: row.get(4)?,
+                        modified_files: row.get(5)?,
+                        deleted_files: row.get(6)?,
+                        embedded_chunks: row.get(7)?,
+                        skipped_embeddings: row.get(8)?,
+                        health_state: health_state_from_name(&row.get::<_, String>(9)?),
+                    })
+                },
+            )
+            .optional()
+    }
+
     fn replace_file_fts(&self, record: &FileRecord) -> Result<()> {
         self.conn.execute(
             "DELETE FROM files_fts WHERE path = ?1",
@@ -652,6 +688,14 @@ fn health_state_name(state: &HealthState) -> &'static str {
         HealthState::Healthy => "healthy",
         HealthState::Degraded => "degraded",
         HealthState::Unavailable => "unavailable",
+    }
+}
+
+fn health_state_from_name(name: &str) -> HealthState {
+    match name {
+        "degraded" => HealthState::Degraded,
+        "unavailable" => HealthState::Unavailable,
+        _ => HealthState::Healthy,
     }
 }
 
