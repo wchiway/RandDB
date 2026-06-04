@@ -359,6 +359,30 @@ impl Store {
         rows.collect()
     }
 
+    pub fn chunk_by_id(&self, chunk_id: &str) -> Result<Option<ChunkRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, file_path, chunk_index, start_line, end_line, start_utf16, end_utf16, breadcrumb, content
+                 FROM chunks
+                 WHERE id = ?1",
+                params![chunk_id],
+                |row| {
+                    Ok(ChunkRecord {
+                        id: row.get(0)?,
+                        file_path: row.get(1)?,
+                        chunk_index: row.get(2)?,
+                        start_line: row.get(3)?,
+                        end_line: row.get(4)?,
+                        start_utf16: row.get(5)?,
+                        end_utf16: row.get(6)?,
+                        breadcrumb: row.get(7)?,
+                        content: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
     pub fn replace_file_vectors(&self, file_path: &str, vectors: &[ChunkVector]) -> Result<()> {
         self.conn.execute(
             "DELETE FROM chunk_vectors WHERE file_path = ?1",
